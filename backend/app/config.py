@@ -31,10 +31,11 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 480
 
-    # OAuth / SSO
+    # OAuth / Google Sign-In
     oauth_client_id: str = ""
     oauth_client_secret: str = ""
-    oauth_discovery_url: str = ""
+    oauth_discovery_url: str = "https://accounts.google.com/.well-known/openid-configuration"
+    oauth_redirect_uri: str = "http://localhost:8000/api/v1/auth/oauth/callback"
 
     # AI Provider Keys
     google_ai_api_key: str = ""

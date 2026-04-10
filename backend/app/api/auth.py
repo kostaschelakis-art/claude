@@ -87,8 +87,8 @@ async def dev_login(
 
 @router.get("/oauth/login")
 async def oauth_login(request: Request):
-    """Redirect the user to the SSO provider's authorization page."""
-    callback_url = str(request.url_for("oauth_callback"))
+    """Redirect the user to Google's authorization page."""
+    callback_url = settings.oauth_redirect_uri or str(request.url_for("oauth_callback"))
     state = secrets.token_urlsafe(32)
     auth_url = await oauth_client.get_authorization_url(
         redirect_uri=callback_url,
@@ -104,8 +104,12 @@ async def oauth_callback(
     request: Request = None,
     db: AsyncSession = Depends(get_db),
 ):
-    """Handle the OAuth callback: exchange code -> fetch profile -> issue JWT."""
-    callback_url = str(request.url_for("oauth_callback"))
+    """Handle Google OAuth callback: exchange code -> fetch profile -> issue JWT.
+
+    Redirects to the frontend with the token in the URL fragment so the
+    React app can pick it up.
+    """
+    callback_url = settings.oauth_redirect_uri or str(request.url_for("oauth_callback"))
 
     # Exchange code for tokens
     tokens = await oauth_client.exchange_code(code=code, redirect_uri=callback_url)
@@ -113,19 +117,20 @@ async def oauth_callback(
     if not access_token:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OAuth provider did not return an access token",
+            detail="Google did not return an access token",
         )
 
-    # Fetch user profile
+    # Fetch user profile from Google
     user_info = await oauth_client.get_user_info(access_token)
     oauth_sub: str = user_info.get("sub", "")
     email: str = user_info.get("email", "")
     full_name: str = user_info.get("name", email.split("@")[0])
+    picture: str = user_info.get("picture", "")
 
     if not email:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="OAuth provider did not return an email address",
+            detail="Google did not return an email address",
         )
 
     # Upsert user
@@ -141,7 +146,7 @@ async def oauth_callback(
             id=uuid.uuid4(),
             email=email,
             full_name=full_name,
-            role=UserRole.VIEWER,
+            role=UserRole.CREATOR,
             is_active=True,
             oauth_provider_id=oauth_sub,
         )
@@ -149,16 +154,15 @@ async def oauth_callback(
         await db.flush()
         await db.refresh(user)
     else:
-        # Update provider id if not yet linked
+        # Update provider id and name if not yet linked
         if not user.oauth_provider_id:
             user.oauth_provider_id = oauth_sub
-            await db.flush()
+        if full_name and user.full_name != full_name:
+            user.full_name = full_name
+        await db.flush()
 
     if not user.is_active:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="User account is inactive",
-        )
+        return RedirectResponse(url="http://localhost:3000/login?error=inactive")
 
     token = create_access_token(
         data={
@@ -168,12 +172,9 @@ async def oauth_callback(
         }
     )
 
-    return TokenResponse(
-        access_token=token,
-        token_type="bearer",
-        expires_in=settings.access_token_expire_minutes * 60,
-        user=UserResponse.model_validate(user),
-    )
+    # Redirect to frontend with token — the React app reads it from the URL
+    frontend_url = f"http://localhost:3000/oauth/callback?token={token}"
+    return RedirectResponse(url=frontend_url)
 
 
 # ------------------------------------------------------------------ #

@@ -10,6 +10,7 @@ import Templates from '@/pages/Templates';
 import BrandGuidelines from '@/pages/BrandGuidelines';
 import Markets from '@/pages/Markets';
 import Admin from '@/pages/Admin';
+import OAuthCallback from '@/pages/OAuthCallback';
 
 function ProtectedRoute({ children, minRole }: { children: React.ReactNode; minRole?: string }) {
   const { isAuthenticated, user } = useAuthStore();
@@ -31,6 +32,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<Login />} />
+      <Route path="/oauth/callback" element={<OAuthCallback />} />
       <Route
         path="/*"
         element={
