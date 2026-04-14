@@ -51,6 +51,8 @@ class Settings(BaseSettings):
 
     # CORS
     cors_origins: list[str] = ["http://localhost:3000", "http://localhost:8000"]
+    # Allow any GitHub Codespaces forwarded URL (*.app.github.dev) via regex
+    cors_origin_regex: str = r"https://.*\.app\.github\.dev"
 
 
 settings = Settings()
