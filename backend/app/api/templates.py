@@ -101,6 +101,7 @@ def _variation_to_dict(v: TemplateVariation) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+@router.post("", status_code=status.HTTP_201_CREATED, include_in_schema=False)
 @router.post("/", status_code=status.HTTP_201_CREATED)
 async def create_template(
     body: TemplateCreateRequest,
@@ -144,42 +145,234 @@ async def create_template(
 @router.post("/analyze")
 async def analyze_template(
     file: UploadFile = File(...),
+    save_as_template: bool = False,
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Accept an uploaded image file and return analysis.
+    """Upload an asset, detect brand patterns, and optionally persist it as a Template.
 
-    This is a placeholder -- a real implementation would send the image to an
-    AI provider for layout analysis and safe-area detection.
+    Pipeline:
+        1. Read the uploaded bytes.
+        2. Upload them to object storage so we keep a reference.
+        3. Call Gemini vision to extract layout zones, dominant colours,
+           typography cues, suggested category, and a short overall-style
+           description.
+        4. Compare the detected palette against the Betano brand palettes
+           and return a brand-alignment report.
+        5. If ``save_as_template=true``, insert a ``Template`` row so the
+           pattern can be reused for future generations.
     """
-    content = await file.read()
-    file_size = len(content)
+    import logging
+    from io import BytesIO
 
-    return {
+    from PIL import Image
+
+    from app.ai.google_imagen import GoogleImagenProvider
+    from app.seed.brand_seed import BETANO_BRAND
+    from app.services.storage_service import S3Client
+
+    logger = logging.getLogger(__name__)
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file upload")
+
+    # --- derive real dimensions from the image ------------------------
+    try:
+        with Image.open(BytesIO(content)) as img:
+            width, height = img.size
+    except Exception:
+        width, height = 1080, 1080
+
+    # --- store the source asset ---------------------------------------
+    source_url: str | None = None
+    try:
+        storage = S3Client()
+        await storage.ensure_bucket()
+        ext = (file.filename or "").rsplit(".", 1)[-1].lower() or "png"
+        if ext not in {"png", "jpg", "jpeg", "webp"}:
+            ext = "png"
+        key = f"uploads/{uuid.uuid4()}.{ext}"
+        source_url = await storage.upload(
+            key=key,
+            data=content,
+            content_type=file.content_type or f"image/{ext}",
+        )
+    except Exception:
+        logger.exception("Failed to upload analysed asset to object storage")
+
+    # --- run Gemini vision analysis ------------------------------------
+    analysis: dict = {}
+    try:
+        provider = GoogleImagenProvider()
+        analysis = await provider.analyze_image(content)
+    except Exception as exc:
+        logger.exception("Gemini vision analysis failed")
+        analysis = {"error": str(exc)}
+
+    # --- brand alignment check ----------------------------------------
+    brand_alignment = _score_brand_alignment(analysis)
+
+    # --- suggested category + safe areas ------------------------------
+    suggested_category = analysis.get("suggested_category") or _guess_category_from_ratio(
+        width, height
+    )
+    safe_areas = _derive_safe_areas(analysis, width, height)
+
+    response: dict[str, Any] = {
         "filename": file.filename,
         "content_type": file.content_type,
-        "file_size": file_size,
-        "analysis": {
-            "detected_safe_areas": [
-                {"x": 50, "y": 50, "w": 200, "h": 100, "label": "text_area"},
-                {"x": 10, "y": 10, "w": 80, "h": 80, "label": "logo_zone"},
-            ],
-            "detected_elements": [
-                {
-                    "element_type": "logo",
-                    "position": {"x": 10, "y": 10, "anchor": "top-left"},
-                    "size": {"width": 80, "height": 80},
-                    "confidence": 0.85,
-                }
-            ],
-            "suggested_dimensions": {"width": 1080, "height": 1920},
-            "suggested_category": "story",
-            "confidence": 0.78,
+        "file_size": len(content),
+        "source_url": source_url,
+        "dimensions": {"width": width, "height": height},
+        "analysis": analysis,
+        "brand_alignment": brand_alignment,
+        "suggested_category": suggested_category,
+        "safe_areas": safe_areas,
+        "brand_context_used": {
+            "sportsbook_primary": list(BETANO_BRAND["colours"]["primary_sportsbook"].keys()),
+            "casino_primary": list(BETANO_BRAND["colours"]["primary_casino"].keys()),
         },
-        "note": "This is a placeholder analysis. A production implementation would use AI vision models.",
+    }
+
+    # --- optionally persist as a reusable template --------------------
+    if save_as_template:
+        try:
+            category_enum = TemplateCategory(suggested_category)
+        except ValueError:
+            category_enum = TemplateCategory.CUSTOM
+
+        template = Template(
+            id=uuid.uuid4(),
+            name=(file.filename or "Uploaded asset")[:255],
+            description=(
+                (analysis.get("overall_style") or "Pattern detected from uploaded asset.")
+                if isinstance(analysis, dict)
+                else "Pattern detected from uploaded asset."
+            )[:2000],
+            category=category_enum,
+            market_id=current_user.market_id,
+            created_by=current_user.id,
+            layout_config={
+                "layout_zones": analysis.get("layout_zones") if isinstance(analysis, dict) else [],
+                "dominant_colors": analysis.get("dominant_colors") if isinstance(analysis, dict) else [],
+                "typography_style": analysis.get("typography_style") if isinstance(analysis, dict) else {},
+            },
+            dimensions_width=width,
+            dimensions_height=height,
+            safe_areas=safe_areas,
+            persistent_elements=[],
+            is_ai_generated=False,
+            source_image_url=source_url,
+        )
+        db.add(template)
+        await db.flush()
+        await db.refresh(template)
+        response["template_id"] = str(template.id)
+
+    return response
+
+
+# --------------------------------------------------------------------------- #
+# Pattern / brand-alignment helpers
+# --------------------------------------------------------------------------- #
+
+
+def _hex_to_rgb(hex_str: str) -> tuple[int, int, int]:
+    h = hex_str.lstrip("#")
+    if len(h) != 6:
+        return (0, 0, 0)
+    return (int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16))
+
+
+def _rgb_distance(a: tuple[int, int, int], b: tuple[int, int, int]) -> float:
+    return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
+
+
+def _score_brand_alignment(analysis: dict) -> dict:
+    """Compare detected dominant colours to the Betano brand palettes."""
+    from app.seed.brand_seed import BETANO_BRAND
+
+    detected = analysis.get("dominant_colors") if isinstance(analysis, dict) else None
+    if not isinstance(detected, list) or not detected:
+        return {
+            "score": 0,
+            "detected_hexes": [],
+            "matches": [],
+            "note": "No dominant colour data available.",
+        }
+
+    # Build a lookup of brand colour name -> rgb
+    brand_colors: list[tuple[str, tuple[int, int, int]]] = []
+    for mode in ("primary_sportsbook", "primary_casino", "tonal"):
+        for name, spec in BETANO_BRAND["colours"][mode].items():
+            brand_colors.append((f"{mode}.{name}", tuple(spec["rgb"])))  # type: ignore[arg-type]
+
+    detected_hexes: list[str] = []
+    matches: list[dict] = []
+    for entry in detected:
+        hex_val = entry.get("hex") if isinstance(entry, dict) else str(entry)
+        if not isinstance(hex_val, str):
+            continue
+        rgb = _hex_to_rgb(hex_val)
+        detected_hexes.append(hex_val)
+        best = min(brand_colors, key=lambda bc: _rgb_distance(bc[1], rgb))
+        distance = _rgb_distance(best[1], rgb)
+        matches.append(
+            {
+                "detected_hex": hex_val,
+                "closest_brand_colour": best[0],
+                "distance": round(distance, 1),
+                "is_brand_match": distance < 40,
+            }
+        )
+
+    hit_count = sum(1 for m in matches if m["is_brand_match"])
+    score = int(round((hit_count / max(1, len(matches))) * 100))
+    return {
+        "score": score,
+        "detected_hexes": detected_hexes,
+        "matches": matches,
+        "note": (
+            "Score is the percentage of dominant colours that land within "
+            "40 RGB units of a Betano primary or tonal colour."
+        ),
     }
 
 
+def _guess_category_from_ratio(width: int, height: int) -> str:
+    ratio = width / max(1, height)
+    if ratio < 0.7:
+        return "story"
+    if 0.9 <= ratio <= 1.1:
+        return "casino"
+    if ratio > 1.7:
+        return "slider"
+    return "promo_banner"
+
+
+def _derive_safe_areas(analysis: dict, width: int, height: int) -> list[dict]:
+    zones = analysis.get("layout_zones") if isinstance(analysis, dict) else None
+    if not isinstance(zones, list):
+        return []
+    result: list[dict] = []
+    for z in zones:
+        if not isinstance(z, dict):
+            continue
+        result.append(
+            {
+                "x": int(z.get("x_pct", 0) * width / 100),
+                "y": int(z.get("y_pct", 0) * height / 100),
+                "w": int(z.get("w_pct", 0) * width / 100),
+                "h": int(z.get("h_pct", 0) * height / 100),
+                "label": str(z.get("zone", "area")),
+                "description": str(z.get("description", "")),
+            }
+        )
+    return result
+
+
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_templates(
     category: str | None = Query(default=None),

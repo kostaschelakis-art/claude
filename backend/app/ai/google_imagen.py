@@ -1,34 +1,57 @@
-"""Google Imagen / Gemini AI provider for BrandForge."""
+"""Google Gemini image generation + vision provider.
+
+Uses the ``google-genai`` SDK which supports:
+
+    * ``gemini-2.5-flash-image`` / ``gemini-2.5-flash-image-preview`` —
+      free-tier image generation (great for hobby / demo scale).
+    * ``gemini-2.5-flash`` / ``gemini-2.0-flash`` — multimodal analysis
+      used to inspect uploaded reference images.
+
+The previous implementation targeted Imagen-3 via the legacy
+``google-generativeai`` package, which required a paid AI Studio tier
+and exposed an API surface (``ImageGenerationModel``) that has since
+been removed.  This module replaces it and is safe to call with a free
+``GOOGLE_AI_API_KEY`` generated from https://aistudio.google.com.
+"""
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
 from typing import Any
 
-import google.generativeai as genai
-from google.generativeai.types import GenerationConfig
+from google import genai
+from google.genai import types as genai_types
 
 from app.ai.provider import AIProvider, GenerationResult
 from app.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Cost estimate in cents per image generation call
-_COST_PER_IMAGE_CENTS = 2
+# Free-tier Gemini image generation.
+_IMAGE_MODEL = "gemini-2.5-flash-image"
+_IMAGE_MODEL_FALLBACK = "gemini-2.0-flash-preview-image-generation"
+_TEXT_MODEL = "gemini-2.5-flash"
+
+# Cost estimate in cents per image — essentially free tier, track a nominal 0.
+_COST_PER_IMAGE_CENTS = 0
 
 
 class GoogleImagenProvider(AIProvider):
-    """AI provider backed by Google Imagen (image gen) and Gemini (analysis)."""
+    """AI provider backed by Google's Gemini multimodal API."""
 
     def __init__(self) -> None:
-        genai.configure(api_key=settings.google_ai_api_key)
-        self._imagen_model = "imagen-3.0-generate-002"
-        self._gemini_model = "gemini-2.0-flash"
+        if not settings.google_ai_api_key:
+            raise RuntimeError(
+                "GOOGLE_AI_API_KEY is not configured. "
+                "Generate one at https://aistudio.google.com and put it in .env."
+            )
+        self._client = genai.Client(api_key=settings.google_ai_api_key)
 
     # ------------------------------------------------------------------
-    # Public interface
+    # Core image generation
     # ------------------------------------------------------------------
 
     async def generate(
@@ -39,37 +62,27 @@ class GoogleImagenProvider(AIProvider):
         num_images: int = 1,
         style: dict | None = None,
     ) -> GenerationResult:
-        """Generate images from a text prompt using Imagen."""
-        try:
-            enhanced_prompt = self._build_prompt(prompt, width, height, style)
-            imagen = genai.ImageGenerationModel(self._imagen_model)
+        """Generate one or more images from a text prompt."""
+        images: list[bytes] = []
+        model_used = _IMAGE_MODEL
 
-            response = imagen.generate_images(
-                prompt=enhanced_prompt,
-                number_of_images=num_images,
-                aspect_ratio=self._aspect_ratio(width, height),
-            )
+        for _ in range(max(1, num_images)):
+            image_bytes = await asyncio.to_thread(self._call_image_model, prompt)
+            images.append(image_bytes)
 
-            images: list[bytes] = []
-            for generated_image in response.images:
-                images.append(generated_image._image_bytes)
-
-            return GenerationResult(
-                images=images,
-                layers=[],
-                model_used=self._imagen_model,
-                generation_params={
-                    "prompt": enhanced_prompt,
-                    "width": width,
-                    "height": height,
-                    "num_images": num_images,
-                    "style": style,
-                },
-                cost_cents=_COST_PER_IMAGE_CENTS * num_images,
-            )
-        except Exception:
-            logger.exception("Google Imagen generation failed")
-            raise
+        return GenerationResult(
+            images=images,
+            layers=[],
+            model_used=model_used,
+            generation_params={
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "num_images": num_images,
+                "style": style,
+            },
+            cost_cents=_COST_PER_IMAGE_CENTS * num_images,
+        )
 
     async def generate_layers(
         self,
@@ -78,91 +91,83 @@ class GoogleImagenProvider(AIProvider):
         height: int,
         layer_descriptions: list[str],
     ) -> GenerationResult:
-        """Generate separate layers by issuing one call per layer description."""
-        try:
-            imagen = genai.ImageGenerationModel(self._imagen_model)
-            images: list[bytes] = []
-            layers: list[dict] = []
+        """Generate each layer with a separate call.
 
-            for idx, layer_desc in enumerate(layer_descriptions):
-                if idx == 0:
-                    layer_prompt = (
-                        f"Background layer: {layer_desc}. "
-                        f"Create a seamless background suitable for a "
-                        f"{width}x{height} composition."
-                    )
-                else:
-                    layer_prompt = (
-                        f"Foreground element with transparent background: "
-                        f"{layer_desc}. The element should be isolated on a "
-                        f"clean transparent or solid-color background for easy "
-                        f"compositing."
-                    )
+        Gemini image gen does not natively support transparent subjects,
+        so we request each layer with explicit instructions to isolate
+        the subject on a neutral background.
+        """
+        images: list[bytes] = []
+        layers: list[dict] = []
 
-                response = imagen.generate_images(
-                    prompt=layer_prompt,
-                    number_of_images=1,
-                    aspect_ratio=self._aspect_ratio(width, height),
+        for idx, desc in enumerate(layer_descriptions):
+            if idx == 0:
+                layer_prompt = (
+                    f"{prompt}\n\nLayer brief — background only: {desc}. "
+                    "Create a seamless background suitable for layering "
+                    "foreground elements on top."
+                )
+            else:
+                layer_prompt = (
+                    f"{prompt}\n\nLayer brief — foreground element: {desc}. "
+                    "Isolate the subject clearly on a plain neutral "
+                    "background so it can be composited later."
                 )
 
-                layer_bytes = response.images[0]._image_bytes
-                images.append(layer_bytes)
-                layers.append(
-                    {
-                        "index": idx,
-                        "description": layer_desc,
-                        "prompt_used": layer_prompt,
-                        "layer_type": "background" if idx == 0 else "subject",
-                    }
-                )
-
-            return GenerationResult(
-                images=images,
-                layers=layers,
-                model_used=self._imagen_model,
-                generation_params={
-                    "prompt": prompt,
-                    "width": width,
-                    "height": height,
-                    "layer_descriptions": layer_descriptions,
-                },
-                cost_cents=_COST_PER_IMAGE_CENTS * len(layer_descriptions),
+            image_bytes = await asyncio.to_thread(self._call_image_model, layer_prompt)
+            images.append(image_bytes)
+            layers.append(
+                {
+                    "index": idx,
+                    "description": desc,
+                    "prompt_used": layer_prompt,
+                    "layer_type": "background" if idx == 0 else "subject",
+                }
             )
-        except Exception:
-            logger.exception("Google Imagen layer generation failed")
-            raise
+
+        return GenerationResult(
+            images=images,
+            layers=layers,
+            model_used=_IMAGE_MODEL,
+            generation_params={
+                "prompt": prompt,
+                "width": width,
+                "height": height,
+                "layer_descriptions": layer_descriptions,
+            },
+            cost_cents=_COST_PER_IMAGE_CENTS * len(layer_descriptions),
+        )
 
     async def analyze_image(self, image_data: bytes) -> dict:
-        """Use Gemini to analyse an image and extract structured layout info."""
-        try:
-            model = genai.GenerativeModel(self._gemini_model)
+        """Use Gemini to analyse an image and extract structured info."""
+        analysis_prompt = (
+            "Analyse this marketing image and return a JSON object with:\n"
+            '1. "layout_zones": list of {zone, x_pct, y_pct, w_pct, h_pct, description}\n'
+            '2. "dominant_colors": list of {hex, role} where role is one of '
+            '"background", "accent", "foreground"\n'
+            '3. "typography_style": {style, weight, uppercase, estimated_family}\n'
+            '4. "element_positions": list of {element, x_pct, y_pct, w_pct, h_pct}\n'
+            '5. "suggested_category": one of email, story, push, slider, '
+            "promo_banner, in_app, newsletter, casino, sports, custom\n"
+            '6. "overall_style": brief description\n'
+            "Return ONLY valid JSON, no markdown fences."
+        )
 
-            analysis_prompt = (
-                "Analyze this image in detail and return a JSON object with:\n"
-                '1. "layout_zones": list of {zone, x_pct, y_pct, w_pct, h_pct, description}\n'
-                '2. "dominant_colors": list of hex color strings\n'
-                '3. "typography_style": {style, weight, estimated_fonts}\n'
-                '4. "element_positions": list of {element, x_pct, y_pct, w_pct, h_pct}\n'
-                '5. "overall_style": brief description of the visual style\n'
-                "Return ONLY valid JSON, no markdown fences."
-            )
-
-            image_part = {
-                "mime_type": "image/png",
-                "data": base64.b64encode(image_data).decode("utf-8"),
-            }
-
-            response = model.generate_content(
-                [analysis_prompt, image_part],
-                generation_config=GenerationConfig(
+        def _call() -> str:
+            response = self._client.models.generate_content(
+                model=_TEXT_MODEL,
+                contents=[
+                    analysis_prompt,
+                    genai_types.Part.from_bytes(data=image_data, mime_type="image/png"),
+                ],
+                config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
                 ),
             )
+            return response.text or ""
 
-            return self._parse_json_response(response.text)
-        except Exception:
-            logger.exception("Google Gemini image analysis failed")
-            raise
+        text = await asyncio.to_thread(_call)
+        return self._parse_json_response(text)
 
     async def generate_variations(
         self,
@@ -170,88 +175,97 @@ class GoogleImagenProvider(AIProvider):
         prompt: str,
         num_variations: int = 3,
     ) -> GenerationResult:
-        """Generate prompt-based variations of an image."""
-        try:
-            # Use Gemini to understand the source image first
-            model = genai.GenerativeModel(self._gemini_model)
-            image_part = {
-                "mime_type": "image/png",
-                "data": base64.b64encode(image_data).decode("utf-8"),
-            }
-            desc_response = model.generate_content(
-                [
-                    "Describe this image concisely for re-generation, "
-                    "focusing on composition, colors, and key elements.",
-                    image_part,
+        """Describe the source image, then generate variations from the description."""
+        def _describe() -> str:
+            desc_response = self._client.models.generate_content(
+                model=_TEXT_MODEL,
+                contents=[
+                    "Describe this image concisely for re-generation — focus on "
+                    "composition, colour palette, and key visual elements.",
+                    genai_types.Part.from_bytes(data=image_data, mime_type="image/png"),
                 ],
             )
-            base_description = desc_response.text
+            return (desc_response.text or "").strip()
 
-            # Generate variations via Imagen with tweaked prompts
-            imagen = genai.ImageGenerationModel(self._imagen_model)
-            variation_prompts = [
-                f"Variation {i + 1} of: {base_description}. {prompt}. "
-                f"Create a distinct yet brand-consistent alternative."
-                for i in range(num_variations)
-            ]
+        base_description = await asyncio.to_thread(_describe)
 
-            images: list[bytes] = []
-            for vp in variation_prompts:
-                response = imagen.generate_images(
-                    prompt=vp,
-                    number_of_images=1,
+        variation_prompts = [
+            f"Variation {i + 1} of: {base_description}\n\n"
+            f"User request: {prompt}\n"
+            "Create a distinct yet brand-consistent alternative."
+            for i in range(num_variations)
+        ]
+
+        images: list[bytes] = []
+        for vp in variation_prompts:
+            images.append(await asyncio.to_thread(self._call_image_model, vp))
+
+        return GenerationResult(
+            images=images,
+            layers=[],
+            model_used=_IMAGE_MODEL,
+            generation_params={
+                "prompt": prompt,
+                "base_description": base_description,
+                "num_variations": num_variations,
+            },
+            cost_cents=_COST_PER_IMAGE_CENTS * num_variations,
+        )
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _call_image_model(self, prompt: str) -> bytes:
+        """Invoke the Gemini image model and return the first image's bytes.
+
+        Tries the stable model first; if it's unavailable (e.g. region
+        restriction), falls back to the preview model id.
+        """
+        errors: list[str] = []
+        for model_id in (_IMAGE_MODEL, _IMAGE_MODEL_FALLBACK):
+            try:
+                response = self._client.models.generate_content(
+                    model=model_id,
+                    contents=[prompt],
+                    config=genai_types.GenerateContentConfig(
+                        response_modalities=["IMAGE", "TEXT"],
+                    ),
                 )
-                images.append(response.images[0]._image_bytes)
+                image_bytes = self._extract_first_image(response)
+                if image_bytes is not None:
+                    return image_bytes
+                errors.append(f"{model_id}: no inline image in response")
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{model_id}: {exc}")
+                logger.warning("Gemini image call on %s failed: %s", model_id, exc)
 
-            return GenerationResult(
-                images=images,
-                layers=[],
-                model_used=self._imagen_model,
-                generation_params={
-                    "prompt": prompt,
-                    "base_description": base_description,
-                    "num_variations": num_variations,
-                },
-                cost_cents=_COST_PER_IMAGE_CENTS * num_variations,
-            )
-        except Exception:
-            logger.exception("Google Imagen variation generation failed")
-            raise
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+        raise RuntimeError(
+            "Gemini image generation failed on all models: " + "; ".join(errors)
+        )
 
     @staticmethod
-    def _build_prompt(
-        prompt: str, width: int, height: int, style: dict | None
-    ) -> str:
-        parts = [prompt]
-        if style:
-            if style.get("mood"):
-                parts.append(f"Mood: {style['mood']}.")
-            if style.get("color_palette"):
-                parts.append(f"Color palette: {', '.join(style['color_palette'])}.")
-            if style.get("art_style"):
-                parts.append(f"Art style: {style['art_style']}.")
-        parts.append(f"Target dimensions: {width}x{height}.")
-        return " ".join(parts)
-
-    @staticmethod
-    def _aspect_ratio(width: int, height: int) -> str:
-        """Map dimensions to a supported Imagen aspect-ratio string."""
-        ratio = width / height
-        if abs(ratio - 1.0) < 0.1:
-            return "1:1"
-        elif ratio > 1.4:
-            return "16:9"
-        elif ratio > 1.1:
-            return "4:3"
-        elif ratio < 0.7:
-            return "9:16"
-        elif ratio < 0.9:
-            return "3:4"
-        return "1:1"
+    def _extract_first_image(response: Any) -> bytes | None:
+        """Walk the Gemini response and return the first inline image bytes."""
+        candidates = getattr(response, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            if content is None:
+                continue
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
+                inline = getattr(part, "inline_data", None)
+                if inline is None:
+                    continue
+                data = getattr(inline, "data", None)
+                if isinstance(data, (bytes, bytearray)):
+                    return bytes(data)
+                if isinstance(data, str):
+                    try:
+                        return base64.b64decode(data)
+                    except Exception:  # noqa: BLE001
+                        continue
+        return None
 
     @staticmethod
     def _parse_json_response(text: str) -> dict[str, Any]:
@@ -263,5 +277,5 @@ class GoogleImagenProvider(AIProvider):
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            logger.warning("Failed to parse Gemini JSON, returning raw text")
+            logger.warning("Failed to parse Gemini JSON; returning raw text")
             return {"raw_response": text}

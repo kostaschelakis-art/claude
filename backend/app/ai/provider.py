@@ -62,22 +62,20 @@ class AIProvider(ABC):
 def get_provider(provider_name: str) -> AIProvider:
     """Factory that returns a concrete AIProvider instance by name.
 
-    Supported names: ``"google"``, ``"openai"``, ``"stability"``.
+    Supported names: ``"google"``, ``"openai"``, ``"stability"``. Imports
+    are deferred per-branch so that a broken optional SDK (e.g. the
+    legacy ``stability-sdk``) does not block providers the user actually
+    wants to use.
     """
-    from app.ai.google_imagen import GoogleImagenProvider
-    from app.ai.openai_dalle import OpenAIDalleProvider
-    from app.ai.stability_ai import StabilityAIProvider
-
-    providers: dict[str, type[AIProvider]] = {
-        "google": GoogleImagenProvider,
-        "openai": OpenAIDalleProvider,
-        "stability": StabilityAIProvider,
-    }
-
-    cls = providers.get(provider_name)
-    if not cls:
-        raise ValueError(
-            f"Unknown provider: {provider_name!r}. "
-            f"Available: {', '.join(providers)}"
-        )
-    return cls()
+    if provider_name == "google":
+        from app.ai.google_imagen import GoogleImagenProvider
+        return GoogleImagenProvider()
+    if provider_name == "openai":
+        from app.ai.openai_dalle import OpenAIDalleProvider
+        return OpenAIDalleProvider()
+    if provider_name == "stability":
+        from app.ai.stability_ai import StabilityAIProvider
+        return StabilityAIProvider()
+    raise ValueError(
+        f"Unknown provider: {provider_name!r}. Available: google, openai, stability"
+    )

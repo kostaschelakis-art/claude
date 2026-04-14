@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi.responses import Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.ai.provider import get_provider
 from app.auth.middleware import get_current_user
 from app.auth.roles import check_market_access
+from app.brand.prompt_builder import build_brand_prompt
 from app.config import settings
 from app.database import get_db
 from app.models import (
@@ -21,10 +25,14 @@ from app.models import (
     ImageLayer,
     ImageReview,
     ImageStatus,
+    Market,
     QAResult,
     User,
     UserRole,
 )
+from app.services.storage_service import S3Client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/images", tags=["images"])
 
@@ -69,7 +77,9 @@ from pydantic import BaseModel, Field
 
 class GenerateRequest(BaseModel):
     prompt: str = Field(..., min_length=1, max_length=4000)
-    market_id: uuid.UUID
+    # market_id is optional – if omitted we fall back to the user's market,
+    # and then to the Global market that is seeded on startup.
+    market_id: uuid.UUID | None = None
     template_id: uuid.UUID | None = None
     width: int = Field(default=1024, gt=0, le=10000)
     height: int = Field(default=1024, gt=0, le=10000)
@@ -78,6 +88,11 @@ class GenerateRequest(BaseModel):
         description="Preset name from /presets/dimensions. Overrides width/height.",
     )
     ai_provider: str | None = Field(
+        default=None,
+        pattern=r"^(google|openai|stability)$",
+    )
+    # Frontend also sends ``provider`` — accept it as a synonym.
+    provider: str | None = Field(
         default=None,
         pattern=r"^(google|openai|stability)$",
     )
@@ -114,10 +129,33 @@ async def generate_image(
     current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Create a GeneratedImage record with PENDING status and return a job_id."""
-    check_market_access(current_user, body.market_id)
+    """Generate an image end-to-end.
 
-    # Resolve dimensions from preset if provided
+    Synchronously calls the configured AI provider, persists the bytes to
+    object storage, stores a ``GeneratedImage`` row with
+    ``ImageStatus.COMPLETED``, and returns the full record — including a
+    ``composite_url`` the frontend can render immediately.
+    """
+    # -------- resolve market ----------------------------------------
+    market_id = body.market_id or current_user.market_id
+    if market_id is None:
+        gm_result = await db.execute(select(Market).where(Market.code == "GLOBAL"))
+        global_market = gm_result.scalar_one_or_none()
+        if global_market is None:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Global market is not seeded; please restart the backend.",
+            )
+        market_id = global_market.id
+
+    check_market_access(current_user, market_id)
+
+    # -------- fetch market for brand context ------------------------
+    market_result = await db.execute(select(Market).where(Market.id == market_id))
+    market = market_result.scalar_one_or_none()
+    disclaimers = market.legal_disclaimers if market else []
+
+    # -------- resolve dimensions ------------------------------------
     width = body.width
     height = body.height
     if body.dimension_preset:
@@ -130,21 +168,105 @@ async def generate_image(
         width = preset["width"]
         height = preset["height"]
 
-    ai_provider = body.ai_provider or settings.default_ai_provider
+    ai_provider_name = body.ai_provider or body.provider or settings.default_ai_provider
 
-    image = GeneratedImage(
-        id=uuid.uuid4(),
-        prompt=body.prompt,
-        user_id=current_user.id,
-        market_id=body.market_id,
-        template_id=body.template_id,
-        ai_provider=ai_provider,
-        status=ImageStatus.PENDING,
+    # -------- build brand-infused prompt ----------------------------
+    branded_prompt = build_brand_prompt(
+        user_prompt=body.prompt,
         width=width,
         height=height,
+        style_preferences=body.style_preferences,
+        market_disclaimers=disclaimers or [],
+    )
+
+    # -------- call the AI provider ----------------------------------
+    try:
+        provider = get_provider(ai_provider_name)
+    except Exception as exc:
+        logger.exception("Failed to instantiate AI provider %s", ai_provider_name)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"AI provider {ai_provider_name!r} is not available: {exc}",
+        )
+
+    image_id = uuid.uuid4()
+    try:
+        result = await provider.generate(
+            prompt=branded_prompt,
+            width=width,
+            height=height,
+            num_images=1,
+            style=body.style_preferences,
+        )
+    except Exception as exc:
+        logger.exception("AI generation failed")
+        # Persist a FAILED row so the user can see the failure reason.
+        image = GeneratedImage(
+            id=image_id,
+            prompt=body.prompt,
+            refined_prompt=branded_prompt,
+            user_id=current_user.id,
+            market_id=market_id,
+            template_id=body.template_id,
+            ai_provider=ai_provider_name,
+            status=ImageStatus.FAILED,
+            width=width,
+            height=height,
+            generation_params={
+                "style_preferences": body.style_preferences,
+                "dimension_preset": body.dimension_preset,
+                "error": str(exc)[:2000],
+            },
+        )
+        db.add(image)
+        await db.flush()
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Image generation failed: {exc}",
+        )
+
+    if not result.images:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="AI provider returned no image bytes.",
+        )
+
+    image_bytes = result.images[0]
+
+    # -------- upload to MinIO ---------------------------------------
+    storage = S3Client()
+    try:
+        await storage.ensure_bucket()
+        key = f"images/{image_id}.png"
+        await storage.upload(key=key, data=image_bytes, content_type="image/png")
+    except Exception:
+        logger.exception("Failed to upload generated image to object storage")
+        key = None  # fall through to DB-only record
+
+    # The browser can't reach http://minio:9000 — serve via backend proxy.
+    composite_url = f"/api/v1/images/{image_id}/file"
+
+    # -------- persist DB record -------------------------------------
+    image = GeneratedImage(
+        id=image_id,
+        prompt=body.prompt,
+        refined_prompt=branded_prompt,
+        user_id=current_user.id,
+        market_id=market_id,
+        template_id=body.template_id,
+        ai_provider=ai_provider_name,
+        ai_model=result.model_used,
+        status=ImageStatus.COMPLETED,
+        composite_url=composite_url,
+        width=width,
+        height=height,
+        format="png",
+        file_size_bytes=len(image_bytes),
         generation_params={
             "style_preferences": body.style_preferences,
             "dimension_preset": body.dimension_preset,
+            "storage_key": key,
+            "cost_cents": result.cost_cents,
         },
     )
     db.add(image)
@@ -152,14 +274,50 @@ async def generate_image(
     await db.refresh(image)
 
     return {
-        "job_id": str(image.id),
-        "status": image.status.value,
+        "id": str(image.id),
         "prompt": image.prompt,
+        "status": image.status.value,
+        "composite_url": image.composite_url,
         "width": image.width,
         "height": image.height,
         "ai_provider": image.ai_provider,
+        "ai_model": image.ai_model,
+        "layers": [],
+        "qa_score": None,
         "created_at": image.created_at.isoformat(),
     }
+
+
+@router.get("/{image_id}/file")
+async def get_image_file(
+    image_id: uuid.UUID,
+    current_user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream the raw PNG bytes of a generated image from object storage."""
+    result = await db.execute(
+        select(GeneratedImage).where(GeneratedImage.id == image_id)
+    )
+    image = result.scalar_one_or_none()
+    if image is None:
+        raise HTTPException(status_code=404, detail="Image not found")
+
+    # Access control
+    if current_user.role != UserRole.SUPER_ADMIN:
+        if image.user_id != current_user.id and image.market_id != current_user.market_id:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    key = (image.generation_params or {}).get("storage_key") if image.generation_params else None
+    if not key:
+        key = f"images/{image_id}.png"
+
+    try:
+        data = await S3Client().download(key)
+    except Exception as exc:
+        logger.exception("Failed to fetch image bytes from storage")
+        raise HTTPException(status_code=404, detail=f"Image bytes unavailable: {exc}")
+
+    return Response(content=data, media_type=f"image/{image.format or 'png'}")
 
 
 @router.get("/{image_id}")
@@ -254,6 +412,7 @@ async def get_image(
     }
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_images(
     market_id: uuid.UUID | None = Query(default=None),

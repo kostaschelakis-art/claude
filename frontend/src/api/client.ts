@@ -70,7 +70,9 @@ export const images = {
     market_id?: string;
   }): Promise<GeneratedImage[]> => {
     const { data } = await api.get('/images', { params });
-    return data;
+    // Backend returns { items, total, limit, offset } — unwrap to array for
+    // callers that expect a plain list.
+    return (data && data.items) ? data.items : data;
   },
   reviewImage: async (id: string, review: ImageReview): Promise<GeneratedImage> => {
     const { data } = await api.post(`/images/${id}/review`, review);
@@ -91,7 +93,7 @@ export const images = {
     return data;
   },
   getPresets: async (): Promise<DimensionPreset[]> => {
-    const { data } = await api.get('/images/presets');
+    const { data } = await api.get('/images/presets/dimensions');
     return data;
   },
 };

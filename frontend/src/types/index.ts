@@ -111,9 +111,10 @@ export interface GenerateRequest {
   height: number;
   market_id?: string;
   template_id?: string;
+  ai_provider?: string;
   provider?: string;
-  style?: string;
-  negative_prompt?: string;
+  dimension_preset?: string;
+  style_preferences?: Record<string, unknown>;
 }
 
 export interface ExportRequest {

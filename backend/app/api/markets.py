@@ -71,6 +71,7 @@ def _market_to_dict(m: Market) -> dict:
 # --------------------------------------------------------------------------- #
 
 
+@router.get("", include_in_schema=False)
 @router.get("/")
 async def list_markets(
     current_user: User = Depends(get_current_user),

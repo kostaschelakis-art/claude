@@ -16,9 +16,37 @@ async def _init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
 
 
+async def _seed_initial_data() -> None:
+    """Seed markets, brand guidelines, and ensure MinIO bucket exists."""
+    import logging
+
+    from app.database import async_session_factory
+    from app.seed.brand_seed import seed_brand_guidelines, seed_markets
+    from app.services.storage_service import S3Client
+
+    logger = logging.getLogger(__name__)
+
+    async with async_session_factory() as session:
+        try:
+            await seed_markets(session)
+            await seed_brand_guidelines(session)
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            logger.exception("Seeding initial data failed")
+            raise
+
+    try:
+        storage = S3Client()
+        await storage.ensure_bucket()
+    except Exception:
+        logger.warning("Could not ensure MinIO bucket on startup", exc_info=True)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
     await _init_db()
+    await _seed_initial_data()
     yield
 
 
@@ -28,6 +56,9 @@ def create_app() -> FastAPI:
         description="AI-powered image generation platform for brand-compliant marketing assets.",
         version="1.0.0",
         lifespan=lifespan,
+        # Don't 307-redirect /images → /images/ — the browser strips auth
+        # headers on the follow-up, which breaks our frontend.
+        redirect_slashes=False,
     )
 
     application.add_middleware(

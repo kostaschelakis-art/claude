@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { Send, Loader2, Settings2 } from 'lucide-react';
 import { useImageStore } from '@/stores/imageStore';
+import { useAuthStore } from '@/stores/authStore';
 import { DIMENSION_PRESETS, groupPresetsByCategory } from '@/utils/dimensions';
 import MessageBubble from './MessageBubble';
 import type { ChatMessage } from '@/types';
@@ -11,6 +12,7 @@ export default function ChatInterface() {
   const [selectedPreset, setSelectedPreset] = useState(DIMENSION_PRESETS[0]);
   const [provider, setProvider] = useState('google');
   const { chatMessages, addChatMessage, isGenerating, generate } = useImageStore();
+  const { user } = useAuthStore();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const grouped = groupPresetsByCategory();
 
@@ -34,7 +36,8 @@ export default function ChatInterface() {
         prompt: userMsg.content,
         width: selectedPreset.width,
         height: selectedPreset.height,
-        provider,
+        ai_provider: provider,
+        market_id: user?.market_id,
       });
 
       const aiMsg: ChatMessage = {

@@ -46,6 +46,13 @@ async def dev_login(
     result = await db.execute(select(User).where(User.email == body.email))
     user = result.scalar_one_or_none()
 
+    # Ensure every account is associated with a market so that
+    # /images/generate (which requires market_id) works out of the box.
+    from app.models import Market
+
+    gm_result = await db.execute(select(Market).where(Market.code == "GLOBAL"))
+    global_market = gm_result.scalar_one_or_none()
+
     if user is None:
         user = User(
             id=uuid.uuid4(),
@@ -53,10 +60,15 @@ async def dev_login(
             full_name=body.full_name or body.email.split("@")[0],
             role=UserRole.CREATOR,
             is_active=True,
+            market_id=global_market.id if global_market else None,
         )
         db.add(user)
         await db.flush()
         await db.refresh(user)
+    elif user.market_id is None and global_market is not None:
+        # Backfill market_id for accounts created before the seed.
+        user.market_id = global_market.id
+        await db.flush()
 
     if not user.is_active:
         raise HTTPException(
@@ -141,6 +153,11 @@ async def oauth_callback(
     )
     user = result.scalar_one_or_none()
 
+    from app.models import Market
+
+    gm_result = await db.execute(select(Market).where(Market.code == "GLOBAL"))
+    global_market = gm_result.scalar_one_or_none()
+
     if user is None:
         user = User(
             id=uuid.uuid4(),
@@ -149,6 +166,7 @@ async def oauth_callback(
             role=UserRole.CREATOR,
             is_active=True,
             oauth_provider_id=oauth_sub,
+            market_id=global_market.id if global_market else None,
         )
         db.add(user)
         await db.flush()
@@ -159,6 +177,8 @@ async def oauth_callback(
             user.oauth_provider_id = oauth_sub
         if full_name and user.full_name != full_name:
             user.full_name = full_name
+        if user.market_id is None and global_market is not None:
+            user.market_id = global_market.id
         await db.flush()
 
     if not user.is_active:
