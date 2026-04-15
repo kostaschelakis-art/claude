@@ -83,17 +83,22 @@ def create_app() -> FastAPI:
 
     @application.exception_handler(ValueError)
     async def value_error_handler(req: Request, exc: ValueError) -> JSONResponse:
-        # Pydantic ValidationError is a subclass of ValueError; re-raise so
-        # FastAPI's built-in RequestValidationError handling (422) applies.
+        # Pydantic ValidationError is a subclass of ValueError. Log it and
+        # surface a 422 with sanitised (JSON-safe) error details.
         if isinstance(exc, PydanticValidationError):
             logger.warning(
                 "Pydantic validation error on %s %s: %s",
                 req.method, req.url.path, exc,
             )
-            return JSONResponse(
-                status_code=422,
-                content={"detail": exc.errors()},
-            )
+            safe_errors = [
+                {
+                    "loc": list(err.get("loc", ())),
+                    "msg": err.get("msg", ""),
+                    "type": err.get("type", ""),
+                }
+                for err in exc.errors()
+            ]
+            return JSONResponse(status_code=422, content={"detail": safe_errors})
         logger.exception("ValueError in handler for %s %s", req.method, req.url.path)
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 

@@ -20,6 +20,28 @@ from app.schemas.user import TokenResponse, UserResponse
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
+def _user_to_response(user: User) -> UserResponse:
+    """Build a UserResponse from a User without triggering lazy loads.
+
+    After ``db.flush()`` SQLAlchemy expires attributes, so letting
+    Pydantic walk the ORM instance may trigger a synchronous lazy load
+    that blows up the async event loop with ``MissingGreenlet``. We
+    therefore project the needed columns manually — they are all
+    already populated on the Python object at this point.
+    """
+    return UserResponse(
+        id=user.id,
+        email=user.email,
+        full_name=user.full_name,
+        role=user.role.value if hasattr(user.role, "value") else str(user.role),
+        market_id=user.market_id,
+        is_active=user.is_active,
+        oauth_provider_id=user.oauth_provider_id,
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )
+
+
 # ------------------------------------------------------------------ #
 # Dev-mode login (email only, no password required)
 # ------------------------------------------------------------------ #
@@ -88,7 +110,7 @@ async def dev_login(
         access_token=token,
         token_type="bearer",
         expires_in=settings.access_token_expire_minutes * 60,
-        user=UserResponse.model_validate(user),
+        user=_user_to_response(user),
     )
 
 
@@ -221,4 +243,4 @@ async def logout(current_user: User = Depends(get_current_user)):
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: User = Depends(get_current_user)):
     """Return the profile of the currently authenticated user."""
-    return UserResponse.model_validate(current_user)
+    return _user_to_response(current_user)
