@@ -268,25 +268,30 @@ async def delete_guideline(
 
 @router.post("/assets", status_code=status.HTTP_201_CREATED)
 async def upload_brand_asset(
-    name: str = Query(..., min_length=1, max_length=255),
-    asset_type: str = Query(..., pattern=r"^(logo|font|graphic|icon|pattern)$"),
-    market_id: uuid.UUID | None = Query(default=None),
     file: UploadFile = File(...),
+    name: str | None = Query(default=None, max_length=255),
+    asset_type: str = Query(default="logo", pattern=r"^(logo|font|graphic|icon|pattern)$"),
+    market_id: uuid.UUID | None = Query(default=None),
     current_user: User = Depends(require_role(UserRole.CREATOR)),
     db: AsyncSession = Depends(get_db),
 ):
-    """Upload a brand asset file."""
+    """Upload a brand asset file and persist the bytes to object storage.
+
+    ``name`` defaults to the uploaded filename (minus extension) and
+    ``asset_type`` defaults to ``logo`` so the simple "Upload Brand
+    Asset" button on the Brand Guidelines page works with no extra
+    UI.
+    """
     if market_id is not None:
         check_market_access(current_user, market_id)
 
     content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Empty file upload")
     file_size = len(content)
 
-    # In production, upload to S3/MinIO and get the URL
-    # For now, generate a placeholder URL
-    file_url = f"/assets/{uuid.uuid4()}/{file.filename}"
-
     from app.models import AssetType
+    from app.services.storage_service import S3Client
 
     try:
         asset_type_enum = AssetType(asset_type)
@@ -296,15 +301,42 @@ async def upload_brand_asset(
             detail=f"Invalid asset type: {asset_type}",
         )
 
+    # Persist the bytes to MinIO and proxy them back via the backend
+    # (the browser can't reach the internal ``minio:9000`` hostname).
+    ext = (file.filename or "").rsplit(".", 1)[-1].lower() or "png"
+    if ext not in {"png", "jpg", "jpeg", "webp", "svg", "gif"}:
+        ext = "png"
+    asset_id = uuid.uuid4()
+    storage_key = f"brand-assets/{asset_id}.{ext}"
+
+    try:
+        storage = S3Client()
+        await storage.ensure_bucket()
+        await storage.upload(
+            key=storage_key,
+            data=content,
+            content_type=file.content_type or f"image/{ext}",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Failed to store brand asset: {exc}",
+        )
+
+    file_url = f"/api/v1/brand/assets/{asset_id}/file"
+
+    display_name = name or (file.filename or "Brand asset").rsplit(".", 1)[0][:255]
+
     asset = BrandAsset(
-        id=uuid.uuid4(),
-        name=name,
+        id=asset_id,
+        name=display_name,
         asset_type=asset_type_enum,
         file_url=file_url,
         metadata_={
             "original_filename": file.filename,
             "content_type": file.content_type,
             "file_size": file_size,
+            "storage_key": storage_key,
         },
         market_id=market_id,
     )
@@ -348,6 +380,43 @@ async def list_brand_assets(
         "items": [_asset_to_dict(a) for a in assets],
         "total": len(assets),
     }
+
+
+@router.get("/assets/{asset_id}/file")
+async def get_brand_asset_file(
+    asset_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+):
+    """Stream a brand asset's bytes. Unauthenticated so ``<img>`` tags work."""
+    from fastapi.responses import Response
+
+    from app.services.storage_service import S3Client
+
+    result = await db.execute(
+        select(BrandAsset).where(BrandAsset.id == asset_id)
+    )
+    asset = result.scalar_one_or_none()
+    if asset is None:
+        raise HTTPException(status_code=404, detail="Brand asset not found")
+
+    meta = asset.metadata_ or {}
+    key = meta.get("storage_key")
+    if not key:
+        raise HTTPException(status_code=404, detail="Asset bytes unavailable")
+
+    try:
+        data = await S3Client().download(key)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=404, detail=f"Asset bytes unavailable: {exc}"
+        )
+
+    media_type = meta.get("content_type") or "application/octet-stream"
+    return Response(
+        content=data,
+        media_type=media_type,
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 # --------------------------------------------------------------------------- #
