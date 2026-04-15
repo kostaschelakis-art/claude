@@ -1,14 +1,18 @@
 """BrandForge API - AI Image Generation Platform."""
 
+import logging
 from contextlib import asynccontextmanager
 from collections.abc import AsyncGenerator
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import ValidationError as PydanticValidationError
 
 from app.config import settings
 from app.database import engine, Base
+
+logger = logging.getLogger(__name__)
 
 
 async def _init_db() -> None:
@@ -78,7 +82,19 @@ def create_app() -> FastAPI:
         return {"status": "healthy", "service": "brandforge-api", "version": "1.0.0"}
 
     @application.exception_handler(ValueError)
-    async def value_error_handler(_req: Request, exc: ValueError) -> JSONResponse:
+    async def value_error_handler(req: Request, exc: ValueError) -> JSONResponse:
+        # Pydantic ValidationError is a subclass of ValueError; re-raise so
+        # FastAPI's built-in RequestValidationError handling (422) applies.
+        if isinstance(exc, PydanticValidationError):
+            logger.warning(
+                "Pydantic validation error on %s %s: %s",
+                req.method, req.url.path, exc,
+            )
+            return JSONResponse(
+                status_code=422,
+                content={"detail": exc.errors()},
+            )
+        logger.exception("ValueError in handler for %s %s", req.method, req.url.path)
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
     @application.exception_handler(PermissionError)
