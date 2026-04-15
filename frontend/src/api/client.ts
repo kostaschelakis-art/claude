@@ -106,7 +106,8 @@ export const templates = {
     limit?: number;
   }): Promise<Template[]> => {
     const { data } = await api.get('/templates', { params });
-    return data;
+    // Backend returns { items, total, limit, offset } — unwrap to array.
+    return (data && data.items) ? data.items : data;
   },
   create: async (templateData: Partial<Template>): Promise<Template> => {
     const { data } = await api.post('/templates', templateData);
@@ -125,7 +126,7 @@ export const templates = {
     params?: { width?: number; height?: number }
   ): Promise<GeneratedImage[]> => {
     const { data } = await api.get(`/templates/${id}/variations`, { params });
-    return data;
+    return (data && data.items) ? data.items : data;
   },
 };
 
@@ -133,7 +134,7 @@ export const templates = {
 export const markets = {
   list: async (): Promise<Market[]> => {
     const { data } = await api.get('/markets');
-    return data;
+    return (data && data.items) ? data.items : data;
   },
   get: async (id: string): Promise<Market> => {
     const { data } = await api.get(`/markets/${id}`);
@@ -153,7 +154,7 @@ export const markets = {
 export const brand = {
   listGuidelines: async (): Promise<BrandGuideline[]> => {
     const { data } = await api.get('/brand/guidelines');
-    return data;
+    return (data && data.items) ? data.items : data;
   },
   createGuideline: async (guidelineData: Partial<BrandGuideline>): Promise<BrandGuideline> => {
     const { data } = await api.post('/brand/guidelines', guidelineData);
@@ -169,7 +170,7 @@ export const brand = {
   },
   listAssets: async (): Promise<any[]> => {
     const { data } = await api.get('/brand/assets');
-    return data;
+    return (data && data.items) ? data.items : data;
   },
   uploadAsset: async (file: File, category?: string): Promise<any> => {
     const formData = new FormData();

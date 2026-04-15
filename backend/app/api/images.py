@@ -137,7 +137,13 @@ async def generate_image(
     ``composite_url`` the frontend can render immediately.
     """
     # -------- resolve market ----------------------------------------
-    market_id = body.market_id or current_user.market_id
+    # Explicit market from body wins, otherwise fall back to the user's
+    # own market, otherwise to the seeded Global market. We also lazily
+    # backfill users that predate the auto-assignment logic so the
+    # market_access check below doesn't trip on a NULL user.market_id.
+    explicit_market = body.market_id
+    market_id = explicit_market or current_user.market_id
+
     if market_id is None:
         gm_result = await db.execute(select(Market).where(Market.code == "GLOBAL"))
         global_market = gm_result.scalar_one_or_none()
@@ -148,7 +154,17 @@ async def generate_image(
             )
         market_id = global_market.id
 
-    check_market_access(current_user, market_id)
+    # Backfill any user still missing a market assignment.
+    if current_user.market_id is None:
+        current_user.market_id = market_id
+        db.add(current_user)
+        await db.flush()
+
+    # Only enforce access when the caller explicitly picked a market.
+    # The fallback paths above already land on a market the user is
+    # (now) assigned to.
+    if explicit_market is not None:
+        check_market_access(current_user, market_id)
 
     # -------- fetch market for brand context ------------------------
     market_result = await db.execute(select(Market).where(Market.id == market_id))
