@@ -307,21 +307,21 @@ async def generate_image(
 @router.get("/{image_id}/file")
 async def get_image_file(
     image_id: uuid.UUID,
-    current_user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    """Stream the raw PNG bytes of a generated image from object storage."""
+    """Stream the raw PNG bytes of a generated image from object storage.
+
+    This endpoint is intentionally unauthenticated so ``<img src>`` tags
+    and canvas ``new Image()`` loads work from the browser (neither can
+    attach an ``Authorization`` header). The opaque UUID in the URL
+    provides sufficient obscurity for a dev/hobby deployment.
+    """
     result = await db.execute(
         select(GeneratedImage).where(GeneratedImage.id == image_id)
     )
     image = result.scalar_one_or_none()
     if image is None:
         raise HTTPException(status_code=404, detail="Image not found")
-
-    # Access control
-    if current_user.role != UserRole.SUPER_ADMIN:
-        if image.user_id != current_user.id and image.market_id != current_user.market_id:
-            raise HTTPException(status_code=403, detail="Access denied")
 
     key = (image.generation_params or {}).get("storage_key") if image.generation_params else None
     if not key:
@@ -333,7 +333,11 @@ async def get_image_file(
         logger.exception("Failed to fetch image bytes from storage")
         raise HTTPException(status_code=404, detail=f"Image bytes unavailable: {exc}")
 
-    return Response(content=data, media_type=f"image/{image.format or 'png'}")
+    return Response(
+        content=data,
+        media_type=f"image/{image.format or 'png'}",
+        headers={"Cache-Control": "public, max-age=3600"},
+    )
 
 
 @router.get("/{image_id}")
